@@ -4,4 +4,4 @@
 # ==============================================================================
 
 # --- Core Scientific Computing ---
-numpy>=1.26.0,<2.0.0        # NDArray frame processing, audio signal math, WAV I/O
+numpy==1.26.4
