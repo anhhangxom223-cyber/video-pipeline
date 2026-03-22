@@ -2,20 +2,17 @@
 test_integration.py — Integration tests.
 
 Tests cross-module interactions: video-to-audio handoff via AudioInputAdapter,
-full pipeline orchestration with CheckpointRunner and FailureCaptureMiddleware,
-config → pipeline → result end-to-end flow, and observability integration.
+CheckpointRunner + RunFolderManager round-trips, FailureCaptureMiddleware,
+config → pipeline flow, and end-to-end DTO serialization.
 """
 from __future__ import annotations
 
 import json
 import os
 import shutil
-import sys
 import tempfile
-import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+import pytest
 import numpy as np
 
 from audio_pipeline import AudioInputContract, AudioResult
@@ -31,7 +28,6 @@ from config_loader import (
     ResolvedConfig,
     RunMetadata,
     StageCheckpoint,
-    generate_run_id,
     stage_timer,
 )
 from core.runtime.run_folder_manager import RunFolderManager
@@ -41,7 +37,7 @@ from core.observability.metrics_instrumentation import instrument_stage
 
 
 # ============================================================
-# Section 1: Video-to-Audio Handoff
+# Helpers
 # ============================================================
 
 
@@ -56,241 +52,194 @@ def _adapt_video_to_audio(video_result: VideoResult) -> AudioInputContract:
     )
 
 
-class TestVideoToAudioHandoff(unittest.TestCase):
+def _make_video_result(
+    path="/tmp/silent_video.mp4",
+    srt="/tmp/translated.srt",
+):
+    meta = VideoMetadata(width=320, height=240, fps=30.0, frame_count=10)
+    return VideoResult(output_path=path, subtitle_path=srt, metadata=meta)
+
+
+# ============================================================
+# 1  Video-to-Audio Handoff
+# ============================================================
+
+
+class TestVideoToAudioHandoff:
     """
     Freeze spec: VideoResult is the contract boundary between video and audio.
     AudioInputAdapter converts VideoResult → AudioInputContract.
     """
 
-    def _make_video_result(self):
-        meta = VideoMetadata(width=320, height=240, fps=30.0, frame_count=10)
-        return VideoResult(
-            output_path="/tmp/silent_video.mp4",
-            subtitle_path="/tmp/translated.srt",
-            metadata=meta,
-        )
-
-    def test_adapter_produces_audio_input_contract(self):
-        vr = self._make_video_result()
+    def test_produces_audio_input_contract(self):
+        vr = _make_video_result()
         aic = _adapt_video_to_audio(vr)
+        assert isinstance(aic, AudioInputContract)
+        assert aic.silent_video_path == "/tmp/silent_video.mp4"
+        assert aic.translated_srt_path == "/tmp/translated.srt"
 
-        self.assertIsInstance(aic, AudioInputContract)
-        self.assertEqual(aic.silent_video_path, "/tmp/silent_video.mp4")
-        self.assertEqual(aic.translated_srt_path, "/tmp/translated.srt")
-
-    def test_adapter_passes_metadata(self):
-        vr = self._make_video_result()
+    def test_passes_metadata(self):
+        vr = _make_video_result()
         aic = _adapt_video_to_audio(vr)
+        assert aic.metadata["width"] == 320
+        assert aic.metadata["height"] == 240
+        assert aic.metadata["fps"] == 30.0
 
-        self.assertIn("width", aic.metadata)
-        self.assertEqual(aic.metadata["width"], 320)
-
-    def test_adapter_rejects_non_video_result(self):
-        with self.assertRaises(TypeError):
+    def test_rejects_non_video_result(self):
+        with pytest.raises(TypeError):
             _adapt_video_to_audio({"not": "a VideoResult"})
 
-    def test_adapter_handles_none_subtitle_path(self):
+    def test_none_subtitle_path_becomes_empty(self):
         meta = VideoMetadata(width=320, height=240, fps=30.0, frame_count=10)
         vr = VideoResult(output_path="/tmp/video.mp4", subtitle_path=None, metadata=meta)
         aic = _adapt_video_to_audio(vr)
-        self.assertEqual(aic.translated_srt_path, "")
+        assert aic.translated_srt_path == ""
 
-    def test_handoff_dto_immutability(self):
-        """Both VideoResult and AudioInputContract must remain frozen."""
-        vr = self._make_video_result()
+    def test_both_dtos_remain_frozen(self):
+        vr = _make_video_result()
         aic = _adapt_video_to_audio(vr)
-
-        with self.assertRaises(Exception):
+        with pytest.raises(Exception):
             vr.output_path = "changed"
-
-        with self.assertRaises(Exception):
+        with pytest.raises(Exception):
             aic.silent_video_path = "changed"
 
 
 # ============================================================
-# Section 2: Config → Pipeline Factory
+# 2  Config Resolution
 # ============================================================
 
 
-class TestConfigToPipelineFactory(unittest.TestCase):
-    """ConfigLoader resolves config and produces valid ResolvedConfig."""
+class TestConfigResolution:
 
-    def test_default_config_resolves(self):
+    def test_defaults_resolve(self):
         resolved = ConfigLoader.resolve()
-        self.assertIn("engine_mode", resolved)
-        self.assertEqual(resolved["engine_mode"], "HSV")
+        assert "engine_mode" in resolved
+        assert resolved["engine_mode"] == "HSV"
 
-    def test_config_resolution_with_cli(self):
-        resolved = ConfigLoader.resolve(cli_args={"fps": "24.0"})
-        self.assertEqual(resolved["fps"], "24.0")
+    def test_cli_override(self):
+        resolved = ConfigLoader.resolve(cli_args={"engine_mode": "LAB"})
+        assert resolved["engine_mode"] == "LAB"
 
-    def test_resolve_from_paths_with_json(self):
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
-            json.dump({"fps": "60.0", "engine_mode": "LAB"}, f)
-            path = f.name
-
-        try:
-            config = ConfigLoader.resolve_from_paths(
-                json_path=path,
-                cli_overrides={"engine_mode": "HSV"},
-            )
-            # CLI overrides JSON
-            self.assertEqual(config.values["engine_mode"], "HSV")
-            # JSON overrides defaults
-            self.assertEqual(config.values["fps"], "60.0")
-        finally:
-            os.unlink(path)
+    def test_json_plus_cli(self, tmp_path):
+        p = tmp_path / "config.json"
+        p.write_text(json.dumps({"engine_mode": "LAB", "target_language": "es"}))
+        config = ConfigLoader.resolve_from_paths(
+            json_path=str(p),
+            cli_overrides={"engine_mode": "HSV"},
+        )
+        assert config.values["engine_mode"] == "HSV"
+        assert config.values["target_language"] == "es"
 
 
 # ============================================================
-# Section 3: CheckpointRunner + RunFolderManager Integration
+# 3  CheckpointRunner + RunFolderManager
 # ============================================================
 
 
-class TestCheckpointIntegration(unittest.TestCase):
+class TestCheckpointIntegration:
     """
     CheckpointRunner persists stage results and resumes on re-run.
     RunFolderManager provides the directory structure.
     """
 
-    def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-        self.run_folder = RunFolderManager(base_dir=self.tmpdir)
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.run_folder = RunFolderManager(base_dir=str(tmp_path))
         self.run_folder.create("integration_test")
         self.metrics = PipelineMetrics("integration_test")
         self.checkpoint = StageCheckpoint(self.run_folder.checkpoint_path())
 
-    def tearDown(self):
-        shutil.rmtree(self.tmpdir)
-
-    def test_checkpoint_round_trip_video_result(self):
-        type_registry = {"VideoResult": VideoResult}
-        runner = CheckpointRunner(self.checkpoint, self.metrics, type_registry=type_registry)
-
-        meta = VideoMetadata(width=320, height=240, fps=30.0, frame_count=10)
-        expected = VideoResult(
-            output_path="/tmp/out.mp4",
-            subtitle_path="/tmp/subs.srt",
-            metadata=meta,
+    def test_video_result_round_trip(self):
+        runner = CheckpointRunner(
+            self.checkpoint, self.metrics,
+            type_registry={"VideoResult": VideoResult},
         )
+        expected = _make_video_result()
+        result1 = runner.run_stage("Video", lambda: expected)
+        assert result1 == expected
 
-        def stage_fn():
-            return expected
-
-        # First run: executes and saves checkpoint
-        result1 = runner.run_stage("Video", stage_fn)
-        self.assertEqual(result1, expected)
-
-        # Second run: resumes from checkpoint
         result2 = runner.run_stage("Video", lambda: None)
-        self.assertIsInstance(result2, VideoResult)
-        self.assertEqual(result2.output_path, expected.output_path)
+        assert isinstance(result2, VideoResult)
+        assert result2.output_path == expected.output_path
 
-    def test_checkpoint_round_trip_audio_result(self):
-        type_registry = {"AudioResult": AudioResult}
-        runner = CheckpointRunner(self.checkpoint, self.metrics, type_registry=type_registry)
-
+    def test_audio_result_round_trip(self):
+        runner = CheckpointRunner(
+            self.checkpoint, self.metrics,
+            type_registry={"AudioResult": AudioResult},
+        )
         expected = AudioResult(audio_path="/tmp/audio.wav", metadata={"duration": 10.0})
-
         result1 = runner.run_stage("Audio", lambda: expected)
-        self.assertEqual(result1, expected)
+        assert result1 == expected
 
         result2 = runner.run_stage("Audio", lambda: None)
-        self.assertIsInstance(result2, AudioResult)
-        self.assertEqual(result2.audio_path, expected.audio_path)
+        assert isinstance(result2, AudioResult)
+        assert result2.audio_path == expected.audio_path
 
     def test_metrics_records_stages(self):
         runner = CheckpointRunner(self.checkpoint, self.metrics)
         meta = VideoMetadata(width=320, height=240, fps=30.0, frame_count=10)
-
         runner.run_stage(
             "Stage1",
             lambda: VideoResult(output_path="/tmp/a.mp4", subtitle_path=None, metadata=meta),
         )
-
         summary = self.metrics.get_summary()
-        self.assertEqual(summary["total_stages"], 1)
-        self.assertEqual(summary["passed"], 1)
-        self.assertEqual(summary["failed"], 0)
+        assert summary["total_stages"] == 1
+        assert summary["passed"] == 1
+        assert summary["failed"] == 0
 
 
 # ============================================================
-# Section 4: FailureCaptureMiddleware Integration
+# 4  FailureCaptureMiddleware
 # ============================================================
 
 
-class TestFailureCaptureMiddleware(unittest.TestCase):
-    """
-    FailureCaptureMiddleware wraps pipeline execution and generates
-    a debug report on failure.
-    """
+class TestFailureCaptureMiddleware:
 
-    def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-        self.run_folder = RunFolderManager(base_dir=self.tmpdir)
-        self.run_folder.create("failure_test")
-        self.metrics = PipelineMetrics("failure_test")
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.run_folder = RunFolderManager(base_dir=str(tmp_path))
+        self.run_folder.create("middleware_test")
+        self.metrics = PipelineMetrics("middleware_test")
+        self.config = ResolvedConfig.from_dict({"key": "value"})
+        self.run_metadata = RunMetadata(
+            run_id="test", pipeline_version="3.2.0",
+            config_hash="abc", timestamp="2024-01-01T00:00:00",
+        )
 
-    def tearDown(self):
-        shutil.rmtree(self.tmpdir)
+    def _make_middleware(self):
+        return FailureCaptureMiddleware(
+            run_metadata=self.run_metadata,
+            config=self.config,
+            metrics=self.metrics,
+            run_folder=self.run_folder,
+        )
 
     def test_success_passes_through(self):
-        config = ResolvedConfig.from_dict({"key": "value"})
-        run_metadata = RunMetadata(
-            run_id="test", pipeline_version="3.2.0",
-            config_hash="abc", timestamp="2024-01-01T00:00:00",
-        )
-        middleware = FailureCaptureMiddleware(
-            run_metadata=run_metadata,
-            config=config,
-            metrics=self.metrics,
-            run_folder=self.run_folder,
-        )
-
-        result = middleware.run(lambda: {"status": "ok"})
-        self.assertEqual(result["status"], "ok")
+        result = self._make_middleware().run(lambda: {"status": "ok"})
+        assert result["status"] == "ok"
 
     def test_failure_generates_debug_report(self):
-        config = ResolvedConfig.from_dict({"key": "value"})
-        run_metadata = RunMetadata(
-            run_id="test", pipeline_version="3.2.0",
-            config_hash="abc", timestamp="2024-01-01T00:00:00",
-        )
-        middleware = FailureCaptureMiddleware(
-            run_metadata=run_metadata,
-            config=config,
-            metrics=self.metrics,
-            run_folder=self.run_folder,
-        )
-
-        def failing_pipeline():
-            raise RuntimeError("Pipeline exploded")
-
-        with self.assertRaises(RuntimeError):
-            middleware.run(failing_pipeline)
+        middleware = self._make_middleware()
+        with pytest.raises(RuntimeError):
+            middleware.run(lambda: (_ for _ in ()).throw(RuntimeError("Pipeline exploded")))
 
         report_path = self.run_folder.debug_report_path()
-        self.assertTrue(os.path.isfile(report_path))
-
+        assert os.path.isfile(report_path)
         with open(report_path) as f:
             report = json.load(f)
-
-        self.assertEqual(report["error"]["type"], "RuntimeError")
-        self.assertIn("Pipeline exploded", report["error"]["message"])
-        self.assertIn("pipeline", report)
-        self.assertIn("config", report)
-        self.assertIn("environment", report)
+        assert report["error"]["type"] == "RuntimeError"
+        assert "Pipeline exploded" in report["error"]["message"]
+        assert "pipeline" in report
+        assert "config" in report
+        assert "environment" in report
 
 
 # ============================================================
-# Section 5: Mock Frame Generation
+# 5  Mock Frame Generation
 # ============================================================
 
 
-class TestMockFrameGeneration(unittest.TestCase):
-    """Verify numpy frame arrays match freeze spec constraints."""
+class TestMockFrameGeneration:
 
     @staticmethod
     def _generate_frames(width=320, height=240, count=5):
@@ -301,56 +250,52 @@ class TestMockFrameGeneration(unittest.TestCase):
             frame[:, :, 2] = (i * 75) % 256
             yield frame
 
-    def test_frame_shape(self):
+    def test_frame_shape_and_dtype(self):
         frames = list(self._generate_frames(width=320, height=240, count=5))
-        self.assertEqual(len(frames), 5)
+        assert len(frames) == 5
         for frame in frames:
-            self.assertEqual(frame.shape, (240, 320, 3))
-            self.assertEqual(frame.dtype, np.uint8)
+            assert frame.shape == (240, 320, 3)
+            assert frame.dtype == np.uint8
 
-    def test_frames_are_different(self):
+    def test_frames_differ(self):
         frames = list(self._generate_frames(width=64, height=64, count=3))
-        self.assertFalse(np.array_equal(frames[0], frames[1]))
+        assert not np.array_equal(frames[0], frames[1])
 
 
 # ============================================================
-# Section 6: End-to-End Serialization
+# 6  End-to-End Serialization
 # ============================================================
 
 
-class TestEndToEndSerialization(unittest.TestCase):
-    """Video and audio results serialize through checkpoint envelope."""
+class TestEndToEndSerialization:
 
-    def test_video_result_to_dict_from_dict(self):
+    def test_video_result_roundtrip(self):
         meta = VideoMetadata(width=1920, height=1080, fps=60.0, frame_count=3600)
         original = VideoResult(
             output_path="/output/video.mp4",
             subtitle_path="/output/subs.srt",
             metadata=meta,
         )
-        data = original.to_dict()
-        restored = VideoResult.from_dict(data)
-        self.assertEqual(original, restored)
+        assert VideoResult.from_dict(original.to_dict()) == original
 
-    def test_audio_result_to_dict_from_dict(self):
+    def test_audio_result_roundtrip(self):
         original = AudioResult(
             audio_path="/output/audio.wav",
             metadata={"sample_rate": 44100, "channels": 1},
         )
-        data = original.to_dict()
-        restored = AudioResult.from_dict(data)
-        self.assertEqual(original, restored)
+        assert AudioResult.from_dict(original.to_dict()) == original
 
-    def test_audio_input_contract_to_dict_from_dict(self):
+    def test_audio_input_contract_roundtrip(self):
         original = AudioInputContract(
             silent_video_path="/tmp/video.mp4",
             translated_srt_path="/tmp/subs.srt",
             metadata={"fps": 30},
         )
-        data = original.to_dict()
-        restored = AudioInputContract.from_dict(data)
-        self.assertEqual(original, restored)
+        assert AudioInputContract.from_dict(original.to_dict()) == original
 
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_mapping_config_roundtrip(self):
+        original = MappingConfig(
+            version="1.0.0", engine_mode="HSV",
+            mappings=(MappingEntry(source_range=(0, 50), target_hue_range=(100, 150)),),
+        )
+        assert MappingConfig.from_dict(original.to_dict()) == original
